@@ -1,32 +1,16 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <string.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <pthread.h>
-#include <errno.h>
-#include <sys/types.h>
-#include <sys/time.h>
+/*
+ * miner.c
+ * TSOA, 2022
+ *
+ * Find other miners by pinging everyone on the local
+ * network. If none are found, make genesis block and
+ * listen for new transactions/blocks/miners. If there
+ * are miners, download blockchain from them, find the
+ * longest one, and list for new transactions/blocks/miners.
+ */
 
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <ifaddrs.h>
-#include <netdb.h>
+#include "common.h"
 
-#if 1
-#define ENABLE_DEBUG
-#define d() \
-	fprintf(stderr, "got here.\n"); \
-	fflush(stderr);
-
-#endif
-
-#define error(e) perror(e);
-#define warn(w) fprintf(stderr, "warning: %s\n", w);
-
-#define PORT "6942"
 
 /* Switch the endianness of a uint32_t */
 void switch_endian(uint32_t *num)
@@ -62,7 +46,7 @@ int get_ipaddr_data(uint32_t *ipaddr, uint32_t *sbnet_mask)
 
 	for (ifindex = ifstart; ifindex != NULL; ifindex = ifindex->ifa_next) {
 		if (ifindex->ifa_addr && ifindex->ifa_addr->sa_family == AF_INET &&
-				ifindex->ifa_netmask && strcmp(ifindex->ifa_name, "lo")) {
+				ifindex->ifa_netmask) {
 
 			/*
 			 * Store the IP address
@@ -70,6 +54,15 @@ int get_ipaddr_data(uint32_t *ipaddr, uint32_t *sbnet_mask)
 
 			subnet_data = (struct sockaddr_in *) ifindex->ifa_netmask;
 			ipaddr_data = (struct sockaddr_in *) ifindex->ifa_addr;
+
+			/*
+			 * Loopback address
+			 */
+
+			if (ipaddr_data == 0x0100007f) {
+				continue;
+			}
+
 
 			*sbnet_mask = (uint32_t) subnet_data->sin_addr.s_addr;
 			*ipaddr = (uint32_t) ipaddr_data->sin_addr.s_addr;
@@ -169,6 +162,11 @@ void *ping_miners_thread(void *args)
 	int *fd = actual_args[2];
 	int *thread_done = actual_args[3];
 
+	/*
+	 * When parent thread wants to cancel this thread,
+	 * die immediately.
+	 */
+
 	if (pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL) != 0) {
 		error("pthread_setcanceltype()");
 		*thread_done = 1;
@@ -214,7 +212,7 @@ int ping_miners(unsigned conn_timeout, unsigned read_timeout)
 	char ping_msg[] = "ECOIN PING!";
 	char expected[] = "PING ECOIN!";
 
-	size_t ping_size = sizeof(ping_msg);
+	size_t ping_size = sizeof(ping_msg), recv_size;
 
 	char response[ping_size];
 
@@ -249,8 +247,6 @@ int ping_miners(unsigned conn_timeout, unsigned read_timeout)
 	switch_endian(&subnet);
 
 	first_ip = ipaddr & subnet;
-
-	printf("%lu\n", host_num);
 
 	/*
 	 * The reason we switch endianness is because
@@ -401,7 +397,7 @@ int ping_miners(unsigned conn_timeout, unsigned read_timeout)
 			default:
 				{
 #ifdef ENABLE_DEBUG
-					fprintf(stderr, "select returned strange result.\n");
+					fprintf(stderr, "select returned: %d\n", select_ret);
 #endif
 					FD_CLR(server_fd, fd_list);
 					close(server_fd);
@@ -416,7 +412,7 @@ int ping_miners(unsigned conn_timeout, unsigned read_timeout)
 		 * Recieve an echo from the server
 		 */
 
-		if (recv(server_fd, response, ping_size, 0) != ping_size) {
+		if ((recv_size = recv(server_fd, response, ping_size, 0)) != ping_size) {
 			error("recv()");
 			close(server_fd);
 			continue;
@@ -428,7 +424,7 @@ int ping_miners(unsigned conn_timeout, unsigned read_timeout)
 		 * Is the echo malformed or is it expected?
 		 */
 
-		if (strcmp(response, expected)) {
+		if (memcmp(response, expected, recv_size)) {
 
 #ifdef ENABLE_DEBUG
 			fprintf(stderr, "got response, but malformed.\n");
